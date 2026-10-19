@@ -1,0 +1,82 @@
+name: Upload Hokkaido OSM to Turso
+
+on:
+  workflow_dispatch:
+
+jobs:
+  upload:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Install dependencies
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y osmium-tool
+          pip install osmium libsql-experimental
+
+      - name: Download Hokkaido OSM PBF
+        run: |
+          wget https://download.geofabrik.de/asia/japan/hokkaido-latest.osm.pbf -O hokkaido.pbf
+
+      - name: Run Upload Script
+        env:
+          TURSO_URL: ${{ secrets.TURSO_URL }}
+          TURSO_TOKEN: ${{ secrets.TURSO_TOKEN }}
+        run: |
+          python -c "
+          import osmium, json, os, libsql_experimental as libsql
+
+          TURSO_URL = os.environ['TURSO_URL']
+          TURSO_TOKEN = os.environ['TURSO_TOKEN']
+
+          conn = libsql.connect(database=TURSO_URL, auth_token=TURSO_TOKEN)
+          cursor = conn.cursor()
+
+          cursor.execute('DROP TABLE IF EXISTS buildings')
+          cursor.execute('''
+          CREATE TABLE buildings (
+              id INTEGER PRIMARY KEY, name TEXT, height REAL, polygon_json TEXT,
+              min_lat REAL, max_lat REAL, min_lon REAL, max_lon REAL
+          )''')
+          conn.commit()
+
+          class HokkaidoUploader(osmium.SimpleHandler):
+              def __init__(self, conn):
+                  super().__init__()
+                  self.conn = conn
+                  self.cursor = conn.cursor()
+                  self.count = 0
+                  self.batch = []
+
+              def way(self, w):
+                  if 'building' in w.tags and len(w.nodes) >= 3:
+                      coords, lats, lons = [], [], []
+                      for node in w.nodes:
+                          if node.location.valid():
+                              coords.append([node.lon, node.lat])
+                              lats.append(node.lat)
+                              lons.append(node.lon)
+                      if len(coords) >= 3:
+                          height = 12.0
+                          if 'height' in w.tags:
+                              try: height = float(w.tags['height'].replace('m', ''))
+                              except ValueError: pass
+                          elif 'building:levels' in w.tags:
+                              try: height = float(w.tags['building:levels']) * 3.5
+                              except ValueError: pass
+                          name = w.tags.get('name', 'Building')
+                          self.batch.append((w.id, name, height, json.dumps(coords), min(lats), max(lats), min(lons), max(lons)))
+                          self.count += 1
+                          if len(self.batch) >= 500: self.flush()
+
+              def flush(self):
+                  if self.batch:
+                      self.cursor.executemany('INSERT OR REPLACE INTO buildings (id, name, height, polygon_json, min_lat, max_lat, min_lon, max_lon) VALUES (?, ?, ?, ?, ?, ?, ?, ?)', self.batch)
+                      self.conn.commit()
+                      print(f'  -> {self.count} 件送信完了...')
+                      self.batch = []
+
+          handler = HokkaidoUploader(conn)
+          handler.apply_file('hokkaido.pbf', locations=True)
+          handler.flush()
+          print(f'✨ 完了! {handler.count} 件の建物をTursoに保存しました')
+          "
